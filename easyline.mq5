@@ -2,7 +2,7 @@
 #property indicator_chart_window
 #property indicator_plots 0
 
-// 功能说明：EasyLine 是 MT5 图表画线工具，提供 8 个横排按钮、近点 OHLC 吸附绘制和一键清除。
+// 功能说明：EasyLine 是 MT5 图表画线工具，提供 8 个横排按钮、近点 OHLC 吸附绘制、单条删除和双击清空。
 // 主要类/函数职责：BuildUI 负责按钮条刷新，OnChartEvent 负责按钮与绘图事件，GetPointByXY 负责原始点和吸附点计算。
 // 关键依赖：MetaTrader 5 图表对象 API、鼠标事件 API、CopyRates 行情访问接口。
 
@@ -55,9 +55,14 @@ bool           g_saved_context_menu = true;
 bool           g_saved_mouse_move   = false;
 bool           g_saved_mouse_scroll = true;
 bool           g_saved_object_delete = false;
+bool           g_delete_mode = false;
 string         g_base_high_line = "";
 string         g_base_low_line  = "";
 string         g_manual_hline_names[];
+string         g_delete_hover_line = "";
+ulong          g_last_clear_click_ms = 0;
+int            g_last_clear_click_x = -1;
+int            g_last_clear_click_y = -1;
 
 #define BUTTON_SIZE            40
 #define BUTTON_COUNT           8
@@ -70,6 +75,8 @@ string         g_manual_hline_names[];
 #define ICON_THICKNESS         2
 #define ICON_MAX_SEGMENTS      32
 #define SNAP_PIXEL_THRESHOLD   10
+#define DELETE_PIXEL_THRESHOLD 12
+#define CLEAR_DOUBLE_CLICK_MS  400
 #define LINE_LABEL_FONT_SIZE   9
 
 #define NAME_PREVIEW          (g_prefix + "PREVIEW")
@@ -103,6 +110,18 @@ bool IsLineLabelObject(const string name)
 bool IsOurObject(const string name)
   {
    return (StringFind(name, g_prefix) == 0);
+  }
+
+bool IsDeleteModeActive()
+  {
+   return g_delete_mode;
+  }
+
+void ResetClearButtonClickState()
+  {
+   g_last_clear_click_ms = 0;
+   g_last_clear_click_x = -1;
+   g_last_clear_click_y = -1;
   }
 
 int FlagsToMask(const string s)
@@ -370,6 +389,11 @@ bool IsDrawingModeActive()
    return (g_tool != TOOL_NONE);
   }
 
+bool IsChartInteractionModeActive()
+  {
+   return (IsDrawingModeActive() || IsDeleteModeActive());
+  }
+
 string IconObjectName(const string button_name, const string part)
   {
    return button_name + "_ICON_" + part;
@@ -434,7 +458,7 @@ int ButtonTop()
 
 void SyncChartContextMenu()
   {
-   bool enable_context_menu = (!IsDrawingModeActive() && !g_restore_context_menu_on_right_up);
+   bool enable_context_menu = (!IsChartInteractionModeActive() && !g_restore_context_menu_on_right_up);
    ChartSetInteger(0, CHART_CONTEXT_MENU, (enable_context_menu ? g_saved_context_menu : false));
   }
 
@@ -674,9 +698,9 @@ void UpdateButtonStates()
                      BUTTON_SIZE,
                      BUTTON_SIZE,
                      clrNONE,
-                     clrSilver,
-                     STYLE_DASH,
-                     FRAME_UNSELECTED_WIDTH);
+                     (g_delete_mode ? clrWhite : clrSilver),
+                     (g_delete_mode ? STYLE_SOLID : STYLE_DASH),
+                     (g_delete_mode ? FRAME_SELECTED_WIDTH : FRAME_UNSELECTED_WIDTH));
   }
 
 void StartControlsDragCandidate(const int mouse_x, const int mouse_y)
@@ -702,6 +726,7 @@ void StartControlsDrag()
    g_ignore_next_release_click = true;
    g_ignore_release_x = g_drag_start_mouse_x;
    g_ignore_release_y = g_drag_start_mouse_y;
+   ResetClearButtonClickState();
    ClearPreview();
    ChartRedraw(0);
   }
@@ -751,6 +776,233 @@ bool IsEasyLineHorizontalLine(const string name)
       return false;
 
    return ((ENUM_OBJECT)ObjectGetInteger(0, name, OBJPROP_TYPE) == OBJ_HLINE);
+  }
+
+bool IsEasyLineLineObject(const string name)
+  {
+   if(ObjectFind(0, name) < 0 || !IsEasyLineDrawObject(name) || IsLineLabelObject(name))
+      return false;
+
+   ENUM_OBJECT object_type = (ENUM_OBJECT)ObjectGetInteger(0, name, OBJPROP_TYPE);
+   return (object_type == OBJ_HLINE ||
+           object_type == OBJ_VLINE ||
+           object_type == OBJ_TREND);
+  }
+
+double DistanceToSegment(const double px,
+                         const double py,
+                         const double x1,
+                         const double y1,
+                         const double x2,
+                         const double y2)
+  {
+   double dx = x2 - x1;
+   double dy = y2 - y1;
+   double length_sq = dx * dx + dy * dy;
+   if(length_sq <= 0.0)
+      return MathSqrt((px - x1) * (px - x1) + (py - y1) * (py - y1));
+
+   double projection = ((px - x1) * dx + (py - y1) * dy) / length_sq;
+   if(projection < 0.0)
+      projection = 0.0;
+   else if(projection > 1.0)
+      projection = 1.0;
+
+   double nearest_x = x1 + projection * dx;
+   double nearest_y = y1 + projection * dy;
+   return MathSqrt((px - nearest_x) * (px - nearest_x) +
+                   (py - nearest_y) * (py - nearest_y));
+  }
+
+bool GetDeleteDistanceAtXY(const string name,
+                           const int mouse_x,
+                           const int mouse_y,
+                           const datetime raw_time,
+                           const double raw_price,
+                           int &distance)
+  {
+   if(!IsEasyLineLineObject(name))
+      return false;
+
+   ENUM_OBJECT object_type = (ENUM_OBJECT)ObjectGetInteger(0, name, OBJPROP_TYPE);
+   int point_x = 0;
+   int point_y = 0;
+
+   if(object_type == OBJ_HLINE)
+     {
+      double price = ObjectGetDouble(0, name, OBJPROP_PRICE, 0);
+      if(!ChartTimePriceToXY(0, 0, raw_time, price, point_x, point_y))
+         return false;
+
+      distance = MathAbs(point_y - mouse_y);
+      return true;
+     }
+
+   if(object_type == OBJ_VLINE)
+     {
+      datetime line_time = (datetime)ObjectGetInteger(0, name, OBJPROP_TIME, 0);
+      if(!ChartTimePriceToXY(0, 0, line_time, raw_price, point_x, point_y))
+         return false;
+
+      distance = MathAbs(point_x - mouse_x);
+      return true;
+     }
+
+   if(object_type == OBJ_TREND)
+     {
+      datetime time1 = (datetime)ObjectGetInteger(0, name, OBJPROP_TIME, 0);
+      datetime time2 = (datetime)ObjectGetInteger(0, name, OBJPROP_TIME, 1);
+      double price1 = ObjectGetDouble(0, name, OBJPROP_PRICE, 0);
+      double price2 = ObjectGetDouble(0, name, OBJPROP_PRICE, 1);
+      int x1 = 0;
+      int y1 = 0;
+      int x2 = 0;
+      int y2 = 0;
+      if(!ChartTimePriceToXY(0, 0, time1, price1, x1, y1) ||
+         !ChartTimePriceToXY(0, 0, time2, price2, x2, y2))
+         return false;
+
+      distance = (int)MathRound(DistanceToSegment(mouse_x, mouse_y, x1, y1, x2, y2));
+      return true;
+     }
+
+   return false;
+  }
+
+bool FindNearestDeleteTargetAtXY(const int mouse_x,
+                                 const int mouse_y,
+                                 string &best_name)
+  {
+   best_name = "";
+
+   SnapPoint raw_point;
+   if(!GetRawPointByXY(mouse_x, mouse_y, raw_point))
+      return false;
+
+   int best_distance = DELETE_PIXEL_THRESHOLD + 1;
+   for(int i = ObjectsTotal(0, 0, -1) - 1; i >= 0; i--)
+     {
+      string name = ObjectName(0, i, 0, -1);
+      if(!IsEasyLineLineObject(name))
+         continue;
+
+      int distance = 0;
+      if(!GetDeleteDistanceAtXY(name, mouse_x, mouse_y, raw_point.t, raw_point.p, distance))
+         continue;
+
+      if(distance > DELETE_PIXEL_THRESHOLD || distance >= best_distance)
+         continue;
+
+      best_distance = distance;
+      best_name = name;
+     }
+
+   return (best_name != "");
+  }
+
+void SetDeleteHoverLine(const string line_name)
+  {
+   if(g_delete_hover_line == line_name)
+      return;
+
+   if(g_delete_hover_line != "" && ObjectFind(0, g_delete_hover_line) >= 0)
+      ObjectSetInteger(0, g_delete_hover_line, OBJPROP_SELECTED, false);
+
+   g_delete_hover_line = line_name;
+
+   if(g_delete_hover_line != "" && ObjectFind(0, g_delete_hover_line) >= 0)
+     {
+      ObjectSetInteger(0, g_delete_hover_line, OBJPROP_SELECTABLE, true);
+      ObjectSetInteger(0, g_delete_hover_line, OBJPROP_SELECTED, true);
+     }
+  }
+
+void ExitDeleteMode(const bool restore_on_right_up = false)
+  {
+   g_delete_mode = false;
+   ResetClearButtonClickState();
+   SetDeleteHoverLine("");
+   ClearPreview();
+   g_restore_context_menu_on_right_up = restore_on_right_up;
+   SyncChartContextMenu();
+   UpdateButtonStates();
+   ChartRedraw(0);
+  }
+
+void EnterDeleteMode()
+  {
+   g_delete_mode = true;
+   g_tool = TOOL_NONE;
+   ResetTrendAnchor();
+   SetDeleteHoverLine("");
+   ClearPreview();
+   g_restore_context_menu_on_right_up = false;
+   SyncChartContextMenu();
+   UpdateButtonStates();
+   ChartRedraw(0);
+  }
+
+void RememberClearButtonClick(const int x, const int y)
+  {
+   g_last_clear_click_ms = (ulong)GetTickCount();
+   g_last_clear_click_x = x;
+   g_last_clear_click_y = y;
+  }
+
+bool IsClearButtonDoubleClick(const int x, const int y)
+  {
+   if(g_last_clear_click_ms == 0)
+      return false;
+
+   ulong now = (ulong)GetTickCount();
+   if(now - g_last_clear_click_ms > CLEAR_DOUBLE_CLICK_MS)
+      return false;
+
+   return (MathAbs(x - g_last_clear_click_x) <= DRAG_THRESHOLD &&
+           MathAbs(y - g_last_clear_click_y) <= DRAG_THRESHOLD);
+  }
+
+void DeleteDrawObjectWithCleanup(const string name)
+  {
+   if(!IsEasyLineLineObject(name))
+      return;
+
+   if(g_delete_hover_line == name)
+      SetDeleteHoverLine("");
+
+   DeleteObjectIfExists(LineLabelObjectName(name));
+   RemoveManualHLineFromHistory(name);
+   DeleteObjectIfExists(name);
+   RefreshBaselineHorizontalLabels();
+   RefreshAllHorizontalLineLabels();
+   ChartRedraw(0);
+  }
+
+void UpdateDeleteHoverAtXY(const int mouse_x, const int mouse_y)
+  {
+   string target_name = "";
+   if(FindNearestDeleteTargetAtXY(mouse_x, mouse_y, target_name))
+      SetDeleteHoverLine(target_name);
+   else
+      SetDeleteHoverLine("");
+
+   ClearPreview();
+   ChartRedraw(0);
+  }
+
+void HandleDeleteModeClick(const int mouse_x, const int mouse_y)
+  {
+   ResetClearButtonClickState();
+
+   string target_name = "";
+   if(!FindNearestDeleteTargetAtXY(mouse_x, mouse_y, target_name))
+     {
+      SetDeleteHoverLine("");
+      ChartRedraw(0);
+      return;
+     }
+
+   DeleteDrawObjectWithCleanup(target_name);
   }
 
 bool GetNearestBarIndex(const datetime target, int &best_index)
@@ -996,6 +1248,7 @@ void ExitDrawingMode(const bool restore_on_right_up = false)
    g_tool = TOOL_NONE;
    ResetTrendAnchor();
    ClearPreview();
+   SetDeleteHoverLine("");
    g_restore_context_menu_on_right_up = restore_on_right_up;
    SyncChartContextMenu();
    UpdateButtonStates();
@@ -1146,6 +1399,8 @@ void HandleChartLeftClick(const int x, const int y)
    if(g_tool == TOOL_NONE)
       return;
 
+   ResetClearButtonClickState();
+
    SnapPoint sp;
    if(!GetPointByXY(x, y, sp))
       return;
@@ -1176,15 +1431,19 @@ void HandleChartLeftClick(const int x, const int y)
 void SelectColor(const color c)
   {
    g_color = c;
+   ResetClearButtonClickState();
    UpdateButtonStates();
    ChartRedraw(0);
   }
 
 void SelectTool(const ENUM_TOOL_TYPE tool)
   {
+   g_delete_mode = false;
+   SetDeleteHoverLine("");
    g_tool = tool;
    ResetTrendAnchor();
    ClearPreview();
+   ResetClearButtonClickState();
    SyncChartContextMenu();
    UpdateButtonStates();
    ChartRedraw(0);
@@ -1233,7 +1492,12 @@ void ClearAllDrawnLines()
    RemoveAllEasyLineDrawnObjects();
    ResetHorizontalReferenceState();
    ResetTrendAnchor();
+   SetDeleteHoverLine("");
    ClearPreview();
+   g_delete_mode = false;
+   ResetClearButtonClickState();
+   SyncChartContextMenu();
+   UpdateButtonStates();
    ChartRedraw(0);
   }
 
@@ -1269,6 +1533,9 @@ int OnInit()
    g_ignore_release_x = -1;
    g_ignore_release_y = -1;
    g_restore_context_menu_on_right_up = false;
+   g_delete_mode = false;
+   g_delete_hover_line = "";
+   ResetClearButtonClickState();
    ResetHorizontalReferenceState();
    ResetTrendAnchor();
 
@@ -1279,6 +1546,7 @@ int OnInit()
 
 void OnDeinit(const int reason)
   {
+   SetDeleteHoverLine("");
    ChartSetInteger(0, CHART_CONTEXT_MENU, g_saved_context_menu);
    ChartSetInteger(0, CHART_EVENT_MOUSE_MOVE, g_saved_mouse_move);
    ChartSetInteger(0, CHART_MOUSE_SCROLL, g_saved_mouse_scroll);
@@ -1321,9 +1589,13 @@ void OnChartEvent(const int id,
      {
       if(IsEasyLineDrawObject(sparam) && !IsLineLabelObject(sparam))
         {
+         if(g_delete_hover_line == sparam)
+            SetDeleteHoverLine("");
+
          DeleteObjectIfExists(LineLabelObjectName(sparam));
          RemoveManualHLineFromHistory(sparam);
          RefreshBaselineHorizontalLabels();
+         RefreshAllHorizontalLineLabels();
          ChartRedraw(0);
         }
 
@@ -1356,14 +1628,75 @@ void OnChartEvent(const int id,
          g_ignore_chart_click_x = (int)lparam;
          g_ignore_chart_click_y = (int)dparam;
 
-         if(target_name == BTN_CLEAR)             ClearAllDrawnLines();
-         else if(target_name == BTN_COLOR_RED)    SelectColor(clrRed);
-         else if(target_name == BTN_COLOR_YELLOW) SelectColor(clrYellow);
-         else if(target_name == BTN_COLOR_GREEN)  SelectColor(clrLime);
-         else if(target_name == BTN_COLOR_BLUE)   SelectColor(clrBlue);
-         else if(target_name == BTN_TOOL_HLINE)   SelectTool(TOOL_HLINE);
-         else if(target_name == BTN_TOOL_VLINE)   SelectTool(TOOL_VLINE);
-         else if(target_name == BTN_TOOL_TREND)   SelectTool(TOOL_TREND);
+         if(target_name == BTN_CLEAR)
+           {
+            if(IsClearButtonDoubleClick((int)lparam, (int)dparam))
+              {
+               ResetClearButtonClickState();
+               ClearAllDrawnLines();
+              }
+            else
+              {
+               RememberClearButtonClick((int)lparam, (int)dparam);
+               EnterDeleteMode();
+              }
+           }
+         else if(target_name == BTN_COLOR_RED)
+           {
+            ResetClearButtonClickState();
+            SelectColor(clrRed);
+           }
+         else if(target_name == BTN_COLOR_YELLOW)
+           {
+            ResetClearButtonClickState();
+            SelectColor(clrYellow);
+           }
+         else if(target_name == BTN_COLOR_GREEN)
+           {
+            ResetClearButtonClickState();
+            SelectColor(clrLime);
+           }
+         else if(target_name == BTN_COLOR_BLUE)
+           {
+            ResetClearButtonClickState();
+            SelectColor(clrBlue);
+           }
+         else if(target_name == BTN_TOOL_HLINE)
+           {
+            ResetClearButtonClickState();
+            SelectTool(TOOL_HLINE);
+           }
+         else if(target_name == BTN_TOOL_VLINE)
+           {
+            ResetClearButtonClickState();
+            SelectTool(TOOL_VLINE);
+           }
+         else if(target_name == BTN_TOOL_TREND)
+           {
+            ResetClearButtonClickState();
+            SelectTool(TOOL_TREND);
+           }
+
+         return;
+        }
+
+      if(IsDeleteModeActive() && !IsPointInsideControls((int)lparam, (int)dparam))
+        {
+         g_ignore_next_chart_click = true;
+         g_ignore_chart_click_x = (int)lparam;
+         g_ignore_chart_click_y = (int)dparam;
+
+         string delete_name = sparam;
+         if(IsLineLabelObject(delete_name))
+            delete_name = StringSubstr(delete_name, 0, StringLen(delete_name) - 6);
+
+         if(IsEasyLineLineObject(delete_name))
+           {
+            ResetClearButtonClickState();
+            DeleteDrawObjectWithCleanup(delete_name);
+           }
+         else
+            HandleDeleteModeClick((int)lparam, (int)dparam);
 
          return;
         }
@@ -1393,9 +1726,13 @@ void OnChartEvent(const int id,
          SyncChartContextMenu();
         }
 
-      if(IsDrawingModeActive() && right_down && !g_prev_right_down)
+      if(IsChartInteractionModeActive() && right_down && !g_prev_right_down)
         {
-         ExitDrawingMode(true);
+         if(IsDeleteModeActive())
+            ExitDeleteMode(true);
+         else
+            ExitDrawingMode(true);
+
          g_prev_left_down = left_down;
          g_prev_right_down = right_down;
          return;
@@ -1433,6 +1770,7 @@ void OnChartEvent(const int id,
 
       if(IsPointInsideControls(mouse_x, mouse_y))
         {
+         SetDeleteHoverLine("");
          ClearPreview();
          ChartRedraw(0);
          g_prev_left_down = left_down;
@@ -1442,7 +1780,12 @@ void OnChartEvent(const int id,
 
       g_prev_left_down = left_down;
       g_prev_right_down = right_down;
-      UpdatePreviewAtXY(mouse_x, mouse_y);
+
+      if(IsDeleteModeActive())
+         UpdateDeleteHoverAtXY(mouse_x, mouse_y);
+      else
+         UpdatePreviewAtXY(mouse_x, mouse_y);
+
       return;
      }
 
@@ -1483,7 +1826,11 @@ void OnChartEvent(const int id,
       if(IsPointInsideControls((int)lparam, (int)dparam))
          return;
 
-      HandleChartLeftClick((int)lparam, (int)dparam);
+      if(IsDeleteModeActive())
+         HandleDeleteModeClick((int)lparam, (int)dparam);
+      else
+         HandleChartLeftClick((int)lparam, (int)dparam);
+
       return;
      }
   }
